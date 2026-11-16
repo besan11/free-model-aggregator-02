@@ -46,16 +46,24 @@
 //   table.
 //
 // FAILOVER (10%) AND COOLDOWNS
-//   A gateway call answered with a 4xx or a 5xx is not an answer: the
-//   prompt is retried on the next-highest-rated free model that meets it,
-//   and every refusal is counted. A model that refused is skipped for the
-//   rest of the trial, so one rate-limited model never takes every later
-//   prompt down with it. When a retry or a failover serves a prompt, the
-//   refusals ride on the response in the header
+//   A gateway call answered with a 4xx or a 5xx is not an answer. A
+//   refusal that is a rate limit (429) or a server error (5xx) first gets
+//   one bounded same-model retry after a fixed wait: a limit that clears
+//   on the second ask is an answer from the best model, and the first
+//   refusal still rides in the header behind it. A model that refuses
+//   twice, or refuses with any other status, is skipped for the rest of
+//   the trial, so one rate-limited model never takes every later prompt
+//   down with it, and the prompt fails over to the next-highest-rated
+//   free model that meets it. When a retry or a failover serves a prompt,
+//   the refusals ride on the response in the header
 //   x-makefun-upstream-failures, a JSON array of at most 8 rows, each
 //   {"status": <number>, "code": "<string>", "model": "<id or null>"}.
 //   The tie-break is the number of gateway calls, so the first attempt is
-//   always the best model: failover costs a call only when it has to.
+//   always the best model: a retry costs a call only when a refusal has
+//   already happened, and the retry is what keeps the best model serving
+//   instead of the next one down. The wait is a fixed constant, so it
+//   changes no answer: whether a retry happens is a function of the
+//   gateway's answers alone, and a replay sees the same ones.
 //
 // THE MODEL FIELD
 //   Whatever this server reports in a response's `model` field must be the
@@ -111,6 +119,18 @@ const DEFAULT_MAX_TOKENS = 1024;
 const MAX_TOKENS_CAP = 4096;
 /** The most refusal rows the upstream-failures header carries. */
 const MAX_FAILURE_ROWS = 8;
+/** The fixed wait, in milliseconds, before one same-model retry of a refused gateway call. */
+const RETRY_DELAY_MS = 500;
+
+/** Whether a gateway refusal is worth one same-model retry: a rate limit or a server error. */
+function isRetryable(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/** A fixed wait: the same-model retry's delay. It changes no answer, only when it is asked. */
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -214,11 +234,40 @@ function gatewayBody(body: Json, model: string): Json {
   return out;
 }
 
+/** One gateway call for a model: an answer, a refusal with its error code, or a gateway that could not be reached. */
+type Attempt =
+  | { kind: 'answer'; upstream: Response }
+  | { kind: 'refused'; status: number; code: string }
+  | { kind: 'unreachable'; message: string };
+
 /**
- * Dial the gateway for one prompt, best model first, failing over down the
- * rating order while a model refuses. Returns the first answer that
- * arrived, with the refusal trail behind it, or null when every candidate
- * refused.
+ * Dial the gateway once for one model and sort the outcome: an answer
+ * keeps its body unread, a refusal is read for its error code, and a
+ * thrown fetch is an unreachable gateway. The caller decides what a
+ * refusal earns: a retry, a failover, or nothing.
+ */
+async function attempt(model: string, body: Json): Promise<Attempt> {
+  let upstream: Response;
+  try {
+    upstream = await dial(model, gatewayBody(body, model));
+  } catch (err) {
+    return { kind: 'unreachable', message: (err as Error).message };
+  }
+  if (upstream.ok) return { kind: 'answer', upstream };
+  const text = await upstream.text().catch(() => '');
+  return { kind: 'refused', status: upstream.status, code: errorCodeOf(upstream.status, text) };
+}
+
+/**
+ * Dial the gateway for one prompt, best model first. A model that refuses
+ * with a rate limit or a server error gets one bounded same-model retry
+ * after a fixed wait: a refusal that clears on the second ask is an
+ * answer, and the first refusal still rides in the header behind it. A
+ * model that refuses twice, or refuses with any other status, is skipped
+ * for the rest of the trial, and the prompt fails over to the
+ * next-highest-rated free model that meets it. Returns the first answer
+ * that arrived, with the refusal trail behind it, or null when every
+ * candidate refused.
  */
 async function serve(
   requires: Requirement,
@@ -226,20 +275,34 @@ async function serve(
 ): Promise<{ model: string; upstream: Response; failures: FailureRow[] } | null> {
   const failures: FailureRow[] = [];
   for (const candidate of candidatesFor(requires)) {
-    let upstream: Response;
-    try {
-      upstream = await dial(candidate.id, gatewayBody(body, candidate.id));
-    } catch (err) {
+    const first = await attempt(candidate.id, body);
+    if (first.kind === 'answer') return { model: candidate.id, upstream: first.upstream, failures };
+    if (first.kind === 'unreachable') {
       refusedModels.add(candidate.id);
       failures.push({ status: 0, code: 'upstream_unreachable', model: candidate.id });
-      log(`gateway unreachable for ${candidate.id}: ${(err as Error).message}`);
+      log(`gateway unreachable for ${candidate.id}: ${first.message}`);
       continue;
     }
-    if (upstream.ok) return { model: candidate.id, upstream, failures };
-    const text = await upstream.text().catch(() => '');
+    if (!isRetryable(first.status)) {
+      refusedModels.add(candidate.id);
+      failures.push({ status: first.status, code: first.code, model: candidate.id });
+      log(`gateway refused ${candidate.id} with HTTP ${first.status}`);
+      continue;
+    }
+    await wait(RETRY_DELAY_MS);
+    const second = await attempt(candidate.id, body);
+    if (second.kind === 'answer') {
+      failures.push({ status: first.status, code: first.code, model: candidate.id });
+      return { model: candidate.id, upstream: second.upstream, failures };
+    }
     refusedModels.add(candidate.id);
-    failures.push({ status: upstream.status, code: errorCodeOf(upstream.status, text), model: candidate.id });
-    log(`gateway refused ${candidate.id} with HTTP ${upstream.status}`);
+    failures.push({ status: first.status, code: first.code, model: candidate.id });
+    if (second.kind === 'refused') {
+      failures.push({ status: second.status, code: second.code, model: candidate.id });
+      log(`gateway refused ${candidate.id} twice: HTTP ${first.status}, then HTTP ${second.status}`);
+    } else {
+      log(`gateway refused ${candidate.id} with HTTP ${first.status}, then unreachable: ${second.message}`);
+    }
   }
   return null;
 }
