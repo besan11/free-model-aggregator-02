@@ -203,10 +203,18 @@ interface FailureRow {
 function errorCodeOf(status: number, text: string): string {
   try {
     const parsed: unknown = JSON.parse(text);
-    if (isRecord(parsed) && isRecord(parsed.error) && typeof parsed.error.code === 'string' && parsed.error.code !== '') {
-      return parsed.error.code;
+    if (isRecord(parsed)) {
+      const error = isRecord(parsed.error) ? parsed.error : null;
+      // The gateway's own code, string or number: the most specific name it gives the refusal.
+      if (error !== null && (typeof error.code === 'string' || typeof error.code === 'number')) {
+        const code = String(error.code);
+        if (code !== '') return code;
+      }
+      // Some gateways name the refusal by its type (rate_limit_error) and carry no code at all.
+      if (error !== null && typeof error.type === 'string' && error.type !== '') return error.type;
+      if (typeof parsed.code === 'string' && parsed.code !== '') return parsed.code;
+      if (typeof parsed.code === 'number') return String(parsed.code);
     }
-    if (isRecord(parsed) && typeof parsed.code === 'string' && parsed.code !== '') return parsed.code;
   } catch {
     // Not JSON: fall through to the status.
   }
