@@ -319,12 +319,36 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
   }
 }
 
+/** The usage a chunk carries, or null when it names no token count at all. An empty usage object is not a report: it must not clobber a real count an earlier chunk carried. */
+function usageOf(chunk: Json): { input_tokens: number; output_tokens: number } | null {
+  if (!isRecord(chunk.usage)) return null;
+  const usage = chunk.usage;
+  const hasPrompt = typeof usage.prompt_tokens === 'number' && Number.isFinite(usage.prompt_tokens);
+  const hasCompletion = typeof usage.completion_tokens === 'number' && Number.isFinite(usage.completion_tokens);
+  if (!hasPrompt && !hasCompletion) return null;
+  return { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) };
+}
+
 /**
  * A Chat Completions SSE stream as the Anthropic event sequence:
  * message_start on the first chunk, content_block_start/delta/stop per text
  * block or tool call, then message_delta with the stop reason and usage,
  * then message_stop. `model` is the id the entry dialled, named back to
  * the client.
+ *
+ * USAGE, AND THE FALLBACK
+ *   The usage the Anthropic stream reports comes from the gateway's usage,
+ *   read off every chunk as it arrives: the separate usage-only chunk a
+ *   gateway sends when stream_options.include_usage is honoured, or the
+ *   usage a gateway carries on its final content chunk instead. Either
+ *   way the last usage seen is the one message_delta carries, so the
+ *   stream reports real token counts even when no separate usage chunk
+ *   ever arrives. A chunk whose usage object names no token count at all
+ *   is not a usage report: it leaves the last real one standing, instead
+ *   of clobbering it with zeros. When the gateway sends no usage anywhere,
+ *   message_delta still carries a usage field, with zeros: the stream
+ *   never ends on a missing field, and the zeros say plainly that no
+ *   count was ever observed.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -337,8 +361,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let textIndex = -1;
   let nextIndex = 0;
   const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
-  let outputTokens = 0;
+  /** The usage the gateway has reported so far, from the most recent chunk that carried one. */
+  let lastUsage: { input_tokens: number; output_tokens: number } | null = null;
 
   const startEvents = (): string[] => {
     if (started) return [];
@@ -354,7 +378,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: inputTokens, output_tokens: 0 },
+          usage: { input_tokens: lastUsage?.input_tokens ?? 0, output_tokens: 0 },
         },
       }),
     ];
@@ -374,7 +398,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     finished = true;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
+      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: lastUsage?.output_tokens ?? 0 } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };
@@ -397,10 +421,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
         continue;
       }
       if (!isRecord(chunk)) continue;
-      if (isRecord(chunk.usage)) {
-        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
-        outputTokens = numberOrZero(chunk.usage.completion_tokens);
-      }
+      const seen = usageOf(chunk);
+      if (seen !== null) lastUsage = seen;
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       const choice = isRecord(choices[0]) ? choices[0] : null;
       if (choice === null) continue;
